@@ -2,6 +2,9 @@ package com.cn.hotitems_analysis
 
 import org.apache.flink.streaming.api.TimeCharacteristic
 import org.apache.flink.streaming.api.scala._
+import org.apache.flink.table.api.{EnvironmentSettings, Slide}
+import org.apache.flink.table.api.scala._
+import org.apache.flink.types.Row
 
 object HotItemsWithSql {
   def main(args: Array[String]): Unit = {
@@ -20,5 +23,61 @@ object HotItemsWithSql {
       .assignAscendingTimestamps(_.timestamp * 1000L)
 
     // 定义表执行环境
+    val settings = EnvironmentSettings
+      .newInstance()
+      .useBlinkPlanner()
+      .inStreamingMode()
+      .build()
+
+    val tableEnv = StreamTableEnvironment.create(env, settings)
+
+    // 基于DataStream创建Table
+    val dataTable = tableEnv.fromDataStream(dataStream, 'itemId, 'behavior, 'timestamp.rowtime as 'ts)
+
+    // 1. Table api 进行开创聚合统计
+    val aggTable = dataTable
+      .filter('behavior === "pv")
+      .window( Slide over 1.hours every 5.minutes on 'ts as 'sw )
+      .groupBy('itemId, 'sw)
+      .select('itemId, 'sw.end as 'windowEnd, 'itemId.count as 'cnt)
+
+    // 用SQL去实现TopN的选取
+    tableEnv.createTemporaryView("aggtable", aggTable, 'itemId, 'windowEnd, 'cnt)
+    val resultTable = tableEnv.sqlQuery(
+      """
+        |select *
+        |  from (
+        |        select *
+        |              ,row_number() over(partition by windowEnd order by cnt desc) as row_num
+        |          from aggtable
+        |          ) t
+        | where row_num <= 5
+      """.stripMargin)
+
+//    resultTable.toRetractStream[Row].print()
+
+    // 纯SQL实现
+    tableEnv.createTemporaryView("datatable", dataStream, 'itemId, 'behavior, 'timestamp.rowtime as 'ts)
+    val resultSqlTable = tableEnv.sqlQuery(
+      """
+        |select *
+        |  from (
+        |        select *
+        |              ,row_number() over(partition by windowEnd order by cnt desc) as row_num
+        |          from (
+        |          select itemId
+        |                ,hop_end(ts, interval '5' minute, interval '1' hour) as windowEnd
+        |                ,count(itemId) as cnt
+        |            from datatable
+        |           where behavior = 'pv'
+        |           group by itemId
+        |                   ,hop(ts, interval '5' minute, interval '1' hour)
+        |          )
+        |          ) t
+        | where row_num <= 5
+      """.stripMargin)
+    resultSqlTable.toRetractStream[Row].print()
+
+    env.execute("hot_items_sql_job")
   }
 }
